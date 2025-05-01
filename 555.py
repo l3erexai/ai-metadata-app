@@ -1,0 +1,219 @@
+import streamlit as st
+import google.generativeai as genai
+from PIL import Image
+import io
+import pandas as pd
+import re
+from google.generativeai.types import StopCandidateException
+from io import StringIO
+
+# --- ตั้งค่าหน้า Streamlit ---
+st.set_page_config(page_title="AI Metadata Exporter (Button Trigger)", layout="wide")
+st.title("🖼️ AI Metadata Exporter (กดปุ่มเพื่อเริ่ม)")
+st.write("อัปโหลดหลายรูปภาพ -> กดปุ่ม 'เริ่มประมวลผล' -> แสดงผลรวม (1 แถว/ภาพ) -> ส่งออกเป็น CSV")
+
+# --- ใส่ API Key (พร้อมค่าเริ่มต้น) ---
+# !!! คำเตือน: ไม่ควร Hardcode API Key ในโค้ดจริง ควรใช้ st.secrets !!!
+default_api_key = "AIzaSyBNqyqhHFzP1fX3Y-JFLJJwyCZ6GCbFWN4"
+api_key = st.text_input(
+    "ใส่ Google AI API Key ของคุณ:",
+    type="password",
+    value=default_api_key # <--- ใส่ค่าเริ่มต้นตรงนี้
+)
+st.caption("ค่าเริ่มต้น API Key ถูกใส่ไว้เพื่อการทดสอบ (ไม่ปลอดภัยสำหรับการใช้งานจริง)")
+
+
+# --- ส่วนอัปโหลดหลายรูปภาพ ---
+uploaded_files = st.file_uploader(
+    "1. เลือกรูปภาพจากเครื่องของคุณ (เลือกได้หลายไฟล์)",
+    type=["jpg", "jpeg", "png"],
+    accept_multiple_files=True
+)
+
+# --- !!! เพิ่มปุ่มกดเริ่มการทำงาน !!! ---
+st.markdown("---") # เส้นคั่น
+process_button_clicked = st.button("🚀 2. เริ่มประมวลผลรูปภาพที่เลือก")
+st.markdown("---") # เส้นคั่น
+
+
+# --- ฟังก์ชันเรียก Gemini API (ไม่ระบุ safety_settings) ---
+def get_gemini_response(api_key_input, image_data, prompt):
+    """ส่งรูปภาพและ Prompt ไปยัง Gemini และรับผลลัพธ์กลับมา (ไม่ระบุ safety_settings)"""
+    response = None
+    try:
+        genai.configure(api_key=api_key_input)
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        response = model.generate_content([prompt, image_data])
+
+        if response.candidates and hasattr(response.candidates[0], 'finish_reason') and response.candidates[0].finish_reason == 'SAFETY':
+             return "API_SAFETY_BLOCK"
+
+        if hasattr(response, 'text'):
+            return response.text
+        elif response.parts:
+             return "".join(part.text for part in response.parts if hasattr(part, 'text'))
+        elif response.candidates and response.candidates[0].content.parts:
+             return "".join(part.text for part in response.candidates[0].content.parts if hasattr(part, 'text'))
+        else:
+            return "API_RESPONSE_ERROR"
+
+    except StopCandidateException:
+         return None
+    except Exception:
+        return None
+
+
+# --- ฟังก์ชันแยก Title และ Keyword (ใช้เวอร์ชันล่าสุด v4) ---
+def parse_gemini_metadata_v4(text_output):
+    """แยก Titles และ Keywords จากข้อความตอบกลับ (v4 - ยืดหยุ่นขึ้น)"""
+    titles = []
+    keywords = []
+    if not text_output or text_output == "API_SAFETY_BLOCK" or text_output == "API_RESPONSE_ERROR":
+        return titles, keywords
+
+    lines = text_output.strip().splitlines()
+    keyword_line_index = -1
+    keyword_string = ""
+
+    for i, line in enumerate(lines):
+        line_lower_stripped = line.strip().lower()
+        if line_lower_stripped.startswith(("keywords:", "tags:", "keywords/tags:")) or \
+           (line_lower_stripped.startswith("**") and ("keywords" in line_lower_stripped or "tags" in line_lower_stripped)):
+            keyword_line_index = i
+            keyword_string = re.sub(r"^\*{0,2}(?:Keywords/Tags|Keywords|Tags):\*{0,2}\s*", "", line.strip(), flags=re.IGNORECASE)
+            break
+
+    if keyword_string:
+         keywords = [kw.strip() for kw in keyword_string.split(',') if kw.strip()][:20]
+
+    if keyword_line_index != -1:
+        for i in range(keyword_line_index):
+            line_stripped = lines[i].strip()
+            if not line_stripped or \
+               line_stripped.lower().startswith(("here's an analysis", "**title suggestion")):
+                continue
+            cleaned_title = re.sub(r"^(?:Title:|\d+\.|\*|-)\s*", "", line_stripped, flags=re.IGNORECASE).strip()
+            if cleaned_title and len(titles) < 10:
+                titles.append(cleaned_title)
+    elif not keywords and len(lines) > 1:
+         last_line = lines[-1].strip()
+         if ':' not in last_line and ',' in last_line and len(last_line.split(',')) > 2:
+              keywords = [kw.strip() for kw in last_line.split(',') if kw.strip()][:20]
+              for i in range(len(lines) - 1):
+                   line_stripped = lines[i].strip()
+                   if not line_stripped or \
+                      line_stripped.lower().startswith(("here's an analysis", "**title suggestion")):
+                       continue
+                   cleaned_title = re.sub(r"^(?:Title:|\d+\.|\*|-)\s*", "", line_stripped, flags=re.IGNORECASE).strip()
+                   if cleaned_title and len(titles) < 10:
+                       titles.append(cleaned_title)
+
+    if not titles:
+         title_matches_fallback = re.findall(r"^Title:\s*(.*)", text_output, re.MULTILINE | re.IGNORECASE)
+         if title_matches_fallback:
+              titles = [match.strip() for match in title_matches_fallback][:10]
+
+    return titles, keywords
+
+# --- ฟังก์ชันสำหรับแปลง DataFrame เป็น CSV ---
+@st.cache_data
+def convert_df_to_csv(df):
+    return df.to_csv(index=False).encode('utf-8')
+
+# --- !!! เริ่มประมวลผลต่อเมื่อกดปุ่ม !!! ---
+if process_button_clicked:
+    if uploaded_files and api_key: # ตรวจสอบว่ามี Input ครบเมื่อกดปุ่ม
+
+        all_results_list = []
+        error_files = []
+        total_files = len(uploaded_files)
+        # ย้าย progress bar มาเริ่มตรงนี้
+        progress_bar = st.progress(0, text="กำลังเตรียมประมวลผล...")
+
+        for i, uploaded_file in enumerate(uploaded_files):
+            filename = uploaded_file.name
+            progress_text = f"กำลังประมวลผลไฟล์: {filename} ({i+1}/{total_files})..."
+            progress_bar.progress((i + 1) / total_files, text=progress_text)
+
+            try:
+                image = Image.open(uploaded_file)
+                # --- ไม่ต้องแสดงรูปตอนประมวลผลแล้ว ---
+
+                prompt = f"""
+                Analyze the provided image ({filename}) thoroughly. Generate:
+                1.  Up to ten (10) diverse Title suggestions. List each on a new line.
+                2.  Up to twenty (20) relevant Keywords/Tags as a comma-separated list, prefixed with "Keywords:".
+                Example:
+                Title Suggestion 1
+                Title Suggestion 2
+                Keywords: kw1, kw2, kw3
+                """
+
+                gemini_result_text = get_gemini_response(api_key, image, prompt)
+
+                if gemini_result_text == "API_SAFETY_BLOCK":
+                     st.warning(f"ไฟล์ '{filename}' ถูกบล็อกโดย Safety Filter")
+                     error_files.append(f"{filename} (Safety Block)")
+                     continue
+                elif gemini_result_text == "API_RESPONSE_ERROR":
+                     st.warning(f"ไฟล์ '{filename}' ไม่สามารถดึงข้อมูลจาก API ได้ถูกต้อง")
+                     error_files.append(f"{filename} (API Response Error)")
+                     continue
+                elif gemini_result_text is None:
+                     st.error(f"เกิดข้อผิดพลาดร้ายแรงในการเรียก API สำหรับไฟล์ '{filename}'")
+                     error_files.append(f"{filename} (API Call Exception)")
+                     continue
+                else:
+                    suggested_titles_list, suggested_keywords_list = parse_gemini_metadata_v4(gemini_result_text)
+                    titles_str = ", ".join(suggested_titles_list) if suggested_titles_list else "-"
+                    keywords_str = ", ".join(suggested_keywords_list) if suggested_keywords_list else "-"
+
+                    all_results_list.append({
+                        "Filename": filename,
+                        "Title": titles_str,
+                        "Keywords": keywords_str
+                    })
+
+            except Exception as e:
+                st.error(f"เกิดข้อผิดพลาดในการประมวลผลไฟล์ '{filename}': {e}")
+                error_files.append(f"{filename} (Processing Error: {e})")
+                continue
+
+        progress_bar.empty() # ล้าง progress bar เมื่อเสร็จ
+
+        # --- แสดงผลลัพธ์รวม ---
+        if all_results_list:
+            st.subheader("📊 ผลลัพธ์ Metadata รวม (1 แถวต่อไฟล์):")
+            final_df = pd.DataFrame(all_results_list)
+            # แสดง DataFrame และปุ่ม Download
+            st.dataframe(final_df, hide_index=True, use_container_width=True)
+            csv_data = convert_df_to_csv(final_df)
+            st.download_button(
+               label="📥 ดาวน์โหลดผลลัพธ์เป็น CSV",
+               data=csv_data,
+               file_name='gemini_metadata_export.csv',
+               mime='text/csv',
+            )
+        else:
+            # แจ้งเตือนถ้าไม่มีผลลัพธ์เลยหลังจากประมวลผล
+            st.info("ไม่มีผลลัพธ์ให้แสดง อาจเกิดข้อผิดพลาดกับทุกไฟล์ที่อัปโหลด หรือไม่มีไฟล์ที่ประมวลผลสำเร็จ")
+
+
+        if error_files:
+             st.warning("ไฟล์ต่อไปนี้เกิดข้อผิดพลาดระหว่างประมวลผล:")
+             for err_file in error_files:
+                 st.markdown(f"- `{err_file}`")
+
+    # --- เงื่อนไขแจ้งเตือนถ้ากดปุ่มแต่ Input ไม่ครบ ---
+    elif not uploaded_files:
+        st.warning("⚠️ กรุณาอัปโหลดรูปภาพก่อนกดปุ่ม 'เริ่มประมวลผล'")
+    elif not api_key:
+         st.warning("⚠️ กรุณาใส่ Google AI API Key ก่อนกดปุ่ม 'เริ่มประมวลผล'")
+
+# --- แสดงข้อความแนะนำเริ่มต้น (ถ้ายังไม่ได้กดปุ่มและยังไม่มีไฟล์) ---
+elif not uploaded_files:
+     st.info("กรุณาอัปโหลดรูปภาพ (เลือกได้หลายไฟล์) แล้วกดปุ่ม 'เริ่มประมวลผล'")
+
+# --- หมายเหตุท้ายแอป ---
+st.markdown("---")
+st.caption("สร้างโดยใช้ Streamlit, Pandas และ Google Gemini API (Model: gemini-1.5-flash, Default Safety)")
