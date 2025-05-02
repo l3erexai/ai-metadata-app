@@ -5,211 +5,340 @@ import io
 import pandas as pd
 import re
 from google.generativeai.types import StopCandidateException
-from io import StringIO # ใช้สำหรับ download button
+from io import StringIO
+import time
+from datetime import datetime, timedelta
+import os
 
 # --- ตั้งค่าหน้า Streamlit ---
-st.set_page_config(page_title="AI Metadata Exporter (Single Row per Image)", layout="wide")
-st.title("🖼️ AI Metadata Exporter (CSV - 1 Row per Image)")
-st.write("อัปโหลดหลายรูปภาพ -> ประมวลผล -> แสดงผลรวม (1 แถว/ภาพ) -> ส่งออกเป็น CSV")
+st.set_page_config(page_title="AI Metadata Processor", layout="wide")
+st.title("🖼️ AI Metadata Processor")
+st.write("อัปโหลดรูปภาพ, กำหนดค่า, เลือกโหมด, ประมวลผล, และส่งออก CSV")
 
-# --- ใส่ API Key ---
-api_key = st.text_input("ใส่ Google AI API Key ของคุณ:", type="password")
+# --- ชื่อไฟล์ CSV ชั่วคราว (สำหรับโหมดปกติ) ---
+TEMP_CSV_FILENAME = "temp_metadata_incremental.csv"
+
+# --- ส่วนจัดการ API Key ---
+api_key = None
+try:
+    api_key = st.secrets["GOOGLE_API_KEY"]
+    st.caption("✔️ Google AI API Key loaded successfully from secrets.")
+except KeyError:
+    st.warning("⚠️ ไม่พบ Google API Key ใน Secrets. กรุณาใส่ด้านล่างเพื่อทดสอบ:")
+    api_key_input = st.text_input("ใส่ Google AI API Key ของคุณ:", type="password")
+    if api_key_input: api_key = api_key_input
+except Exception as e:
+    st.error(f"เกิดข้อผิดพลาดในการโหลด API Key จาก Secrets: {e}")
+    st.info("กรุณาตรวจสอบการตั้งค่า Secrets หรือลองใส่ Key ด้านล่าง:")
+    api_key_input = st.text_input("ใส่ Google AI API Key ของคุณ (สำรอง):", type="password")
+    if api_key_input: api_key = api_key_input
 
 # --- ส่วนอัปโหลดหลายรูปภาพ ---
+st.markdown("---")
+st.subheader("1. อัปโหลดรูปภาพ")
 uploaded_files = st.file_uploader(
-    "เลือกรูปภาพจากเครื่องของคุณ (เลือกได้หลายไฟล์)",
+    "เลือกรูปภาพ (ต้องอัปโหลดรูปภาพเสมอ ไม่ว่าจะทำงานโหมดไหน)",
     type=["jpg", "jpeg", "png"],
     accept_multiple_files=True
 )
 
-# --- ฟังก์ชันเรียก Gemini API (ไม่ระบุ safety_settings) ---
-# (ใช้เวอร์ชันที่ทำงานได้ดีที่สุด)
+if uploaded_files:
+    num_files_uploaded = len(uploaded_files)
+    st.success(f"✅ คุณได้เลือกรูปภาพแล้วทั้งหมด: {num_files_uploaded} ภาพ")
+else:
+    st.info("💡 ยังไม่ได้เลือกรูปภาพ")
+
+# --- ส่วนกำหนดค่า ---
+st.markdown("---")
+st.subheader("2. กำหนดค่าการประมวลผล")
+col_config1, col_config2 = st.columns(2)
+with col_config1:
+    num_titles_req = st.number_input(
+        "จำนวนชื่อภาพ (Titles) ที่ต้องการ:", min_value=1, value=5, step=1,
+        help="AI จะพยายามสร้างให้ได้มากที่สุดไม่เกินจำนวนนี้"
+    )
+with col_config2:
+    num_keywords_req = st.number_input(
+        "จำนวน Keywords/Tags ที่ต้องการ:", min_value=1, value=20, step=1,
+        help="AI จะพยายามสร้างให้ได้มากที่สุดไม่เกินจำนวนนี้"
+    )
+
+# --- !!! ส่วนเลือกโหมดการทำงาน !!! ---
+st.markdown("---")
+st.subheader("3. เลือกโหมดการทำงาน")
+processing_mode = st.radio(
+    "เลือกวิธีประมวลผล:",
+    options=[
+        "ประมวลผลไฟล์ใหม่ / ทำต่อจากไฟล์ชั่วคราว (สร้าง/อัปเดต temp_metadata_incremental.csv)",
+        "แก้ไขข้อมูลที่ขาดหายจากไฟล์ CSV ที่อัปโหลด"
+    ],
+    index=0, # ค่าเริ่มต้นคือโหมดปกติ
+    key="processing_mode_radio" # เพิ่ม key เพื่อให้ state ถูกเก็บ
+)
+
+# --- !!! ช่องอัปโหลด CSV (แสดงเฉพาะโหมดแก้ไข) !!! ---
+existing_csv_file = None
+if processing_mode == "แก้ไขข้อมูลที่ขาดหายจากไฟล์ CSV ที่อัปโหลด":
+    existing_csv_file = st.file_uploader(
+        "อัปโหลดไฟล์ CSV เดิมที่มีข้อมูล (*ต้อง* มีคอลัมน์ 'Filename', 'Title', 'Keywords')",
+        type=["csv"]
+    )
+    if existing_csv_file:
+        st.info("พร้อมสำหรับโหมดแก้ไข CSV (เมื่อกดปุ่มเริ่ม)")
+    else:
+        st.warning("กรุณาอัปโหลดไฟล์ CSV เดิมเพื่อใช้โหมดแก้ไข")
+
+
+# --- ปุ่มกดเริ่มการทำงาน ---
+st.markdown("---")
+button_label = "🚀 เริ่มประมวลผล"
+if processing_mode == "แก้ไขข้อมูลที่ขาดหายจากไฟล์ CSV ที่อัปโหลด":
+    button_label = "🔄 เริ่มแก้ไขข้อมูลจาก CSV"
+
+process_button_clicked = st.button(button_label)
+st.markdown("---")
+
+# --- ฟังก์ชันเรียก Gemini API ---
+# (โค้ดเหมือนเดิม)
 def get_gemini_response(api_key_input, image_data, prompt):
-    """ส่งรูปภาพและ Prompt ไปยัง Gemini และรับผลลัพธ์กลับมา (ไม่ระบุ safety_settings)"""
+    # ... (เนื้อหาฟังก์ชันเหมือนเดิม) ...
+    if not api_key_input: return None
     response = None
     try:
-        genai.configure(api_key=api_key_input)
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        response = model.generate_content([prompt, image_data]) # ไม่มี safety_settings
+        genai.configure(api_key=api_key_input); model = genai.GenerativeModel('gemini-1.5-flash')
+        response = model.generate_content([prompt, image_data])
+        if response.candidates and hasattr(response.candidates[0], 'finish_reason') and response.candidates[0].finish_reason == 'SAFETY': return "API_SAFETY_BLOCK"
+        if hasattr(response, 'text'): return response.text
+        elif response.parts: return "".join(part.text for part in response.parts if hasattr(part, 'text'))
+        elif response.candidates and response.candidates[0].content.parts: return "".join(part.text for part in response.candidates[0].content.parts if hasattr(part, 'text'))
+        else: return "API_RESPONSE_ERROR"
+    except StopCandidateException: return None
+    except Exception as e: print(f"Error in get_gemini_response: {e}"); return None
 
-        if response.candidates and hasattr(response.candidates[0], 'finish_reason') and response.candidates[0].finish_reason == 'SAFETY':
-             return "API_SAFETY_BLOCK"
-
-        if hasattr(response, 'text'):
-            return response.text
-        elif response.parts:
-             return "".join(part.text for part in response.parts if hasattr(part, 'text'))
-        elif response.candidates and response.candidates[0].content.parts:
-             return "".join(part.text for part in response.candidates[0].content.parts if hasattr(part, 'text'))
-        else:
-            return "API_RESPONSE_ERROR"
-
-    except StopCandidateException:
-         # คืนค่า None ปล่อยให้ส่วนหลักจัดการ Error แต่ไม่แสดงในฟังก์ชัน
-         return None
-    except Exception:
-        # คืนค่า None สำหรับ Error อื่นๆ
-        return None
-
-
-# --- ฟังก์ชันแยก Title และ Keyword (ใช้เวอร์ชันล่าสุด v4 ที่ยืดหยุ่น) ---
-# (โค้ดส่วนนี้เหมือนเดิม)
-def parse_gemini_metadata_v4(text_output):
-    """แยก Titles และ Keywords จากข้อความตอบกลับ (v4 - ยืดหยุ่นขึ้น)"""
-    titles = []
-    keywords = []
-    if not text_output or text_output == "API_SAFETY_BLOCK" or text_output == "API_RESPONSE_ERROR":
-        return titles, keywords
-
-    lines = text_output.strip().splitlines()
-    keyword_line_index = -1
-    keyword_string = ""
-
+# --- ฟังก์ชันแยก Title และ Keyword (รับค่าจำนวน) ---
+def parse_gemini_metadata_v5(text_output, requested_titles, requested_keywords):
+    # ... (เนื้อหาฟังก์ชันเหมือนเดิม) ...
+    titles = []; keywords = []
+    if not text_output or text_output == "API_SAFETY_BLOCK" or text_output == "API_RESPONSE_ERROR": return titles, keywords
+    lines = text_output.strip().splitlines(); keyword_line_index = -1; keyword_string = ""
     for i, line in enumerate(lines):
         line_lower_stripped = line.strip().lower()
-        if line_lower_stripped.startswith(("keywords:", "tags:", "keywords/tags:")) or \
-           (line_lower_stripped.startswith("**") and ("keywords" in line_lower_stripped or "tags" in line_lower_stripped)):
-            keyword_line_index = i
-            keyword_string = re.sub(r"^\*{0,2}(?:Keywords/Tags|Keywords|Tags):\*{0,2}\s*", "", line.strip(), flags=re.IGNORECASE)
-            break
-
-    if keyword_string:
-         keywords = [kw.strip() for kw in keyword_string.split(',') if kw.strip()][:20]
-
+        if line_lower_stripped.startswith(("keywords:", "tags:", "keywords/tags:")) or (line_lower_stripped.startswith("**") and ("keywords" in line_lower_stripped or "tags" in line_lower_stripped)):
+            keyword_line_index = i; keyword_string = re.sub(r"^\*{0,2}(?:Keywords/Tags|Keywords|Tags):\*{0,2}\s*", "", line.strip(), flags=re.IGNORECASE); break
+    if keyword_string: keywords = [kw.strip() for kw in keyword_string.split(',') if kw.strip()][:requested_keywords]
     if keyword_line_index != -1:
         for i in range(keyword_line_index):
             line_stripped = lines[i].strip()
-            if not line_stripped or \
-               line_stripped.lower().startswith(("here's an analysis", "**title suggestion")):
-                continue
+            if not line_stripped or line_stripped.lower().startswith(("here's an analysis", "**title suggestion")): continue
             cleaned_title = re.sub(r"^(?:Title:|\d+\.|\*|-)\s*", "", line_stripped, flags=re.IGNORECASE).strip()
-            if cleaned_title and len(titles) < 10:
-                titles.append(cleaned_title)
+            if cleaned_title and len(titles) < requested_titles: titles.append(cleaned_title)
     elif not keywords and len(lines) > 1:
          last_line = lines[-1].strip()
          if ':' not in last_line and ',' in last_line and len(last_line.split(',')) > 2:
-              keywords = [kw.strip() for kw in last_line.split(',') if kw.strip()][:20]
+              keywords = [kw.strip() for kw in last_line.split(',') if kw.strip()][:requested_keywords]
               for i in range(len(lines) - 1):
-                   line_stripped = lines[i].strip()
-                   if not line_stripped or \
-                      line_stripped.lower().startswith(("here's an analysis", "**title suggestion")):
-                       continue
+                   line_stripped = lines[i].strip();
+                   if not line_stripped or line_stripped.lower().startswith(("here's an analysis", "**title suggestion")): continue
                    cleaned_title = re.sub(r"^(?:Title:|\d+\.|\*|-)\s*", "", line_stripped, flags=re.IGNORECASE).strip()
-                   if cleaned_title and len(titles) < 10:
-                       titles.append(cleaned_title)
-
+                   if cleaned_title and len(titles) < requested_titles: titles.append(cleaned_title)
     if not titles:
          title_matches_fallback = re.findall(r"^Title:\s*(.*)", text_output, re.MULTILINE | re.IGNORECASE)
-         if title_matches_fallback:
-              titles = [match.strip() for match in title_matches_fallback][:10]
-
+         if title_matches_fallback: titles = [match.strip() for match in title_matches_fallback][:requested_titles]
     return titles, keywords
 
 # --- ฟังก์ชันสำหรับแปลง DataFrame เป็น CSV ---
 @st.cache_data
 def convert_df_to_csv(df):
-    return df.to_csv(index=False).encode('utf-8')
+    return df.to_csv(index=False, encoding='utf-8').encode('utf-8')
 
-# --- ประมวลผลเมื่อมีการอัปโหลดไฟล์ และใส่ API Key ---
-if uploaded_files and api_key:
-
-    # --- !!! เปลี่ยนโครงสร้างการเก็บข้อมูล: 1 dict ต่อ 1 ไฟล์ !!! ---
-    all_results_list = []
-    error_files = []
-
-    total_files = len(uploaded_files)
-    progress_bar = st.progress(0, text="กำลังเตรียมประมวลผล...")
-
-    for i, uploaded_file in enumerate(uploaded_files):
-        filename = uploaded_file.name
-        progress_text = f"กำลังประมวลผลไฟล์: {filename} ({i+1}/{total_files})..."
-        progress_bar.progress((i + 1) / total_files, text=progress_text)
-
-        try:
-            image = Image.open(uploaded_file)
-
-            # --- Prompt (ขอ 10/20 เหมือนเดิม) ---
-            prompt = f"""
-            Analyze the provided image ({filename}) thoroughly. Generate:
-            1.  Up to ten (10) diverse Title suggestions. List each on a new line.
-            2.  Up to twenty (20) relevant Keywords/Tags as a comma-separated list, prefixed with "Keywords:".
-            Example:
-            Title Suggestion 1
-            Title Suggestion 2
-            Keywords: kw1, kw2, kw3
-            """
-
-            gemini_result_text = get_gemini_response(api_key, image, prompt)
-
-            # --- ตรวจสอบผลลัพธ์จาก API ---
-            if gemini_result_text == "API_SAFETY_BLOCK":
-                 st.warning(f"ไฟล์ '{filename}' ถูกบล็อกโดย Safety Filter")
-                 error_files.append(f"{filename} (Safety Block)")
-                 continue
-            elif gemini_result_text == "API_RESPONSE_ERROR":
-                 st.warning(f"ไฟล์ '{filename}' ไม่สามารถดึงข้อมูลจาก API ได้ถูกต้อง")
-                 error_files.append(f"{filename} (API Response Error)")
-                 continue
-            elif gemini_result_text is None:
-                 st.error(f"เกิดข้อผิดพลาดร้ายแรงในการเรียก API สำหรับไฟล์ '{filename}'")
-                 error_files.append(f"{filename} (API Call Exception)")
-                 continue
-            else:
-                # --- Parse ผลลัพธ์เป็น List ---
-                suggested_titles_list, suggested_keywords_list = parse_gemini_metadata_v4(gemini_result_text)
-
-                # --- !!! รวม List เป็น String เดียว !!! ---
-                titles_str = ", ".join(suggested_titles_list) if suggested_titles_list else "-"
-                keywords_str = ", ".join(suggested_keywords_list) if suggested_keywords_list else "-"
-
-                # --- !!! เพิ่ม Dictionary ของไฟล์นี้เข้า List รวม (1 ไฟล์ 1 dict) !!! ---
-                all_results_list.append({
-                    "Filename": filename,
-                    "Title": titles_str, # ใช้ชื่อคอลัมน์ตามตัวอย่าง CSV
-                    "Keywords": keywords_str # ใช้ชื่อคอลัมน์ตามตัวอย่าง CSV
-                })
-
-                # --- (Optional) แสดง Raw response สำหรับไฟล์นี้ ---
-                # with st.expander(f"Raw Response for {filename}"):
-                #      st.text_area(f"Raw_{filename}", gemini_result_text, height=100)
-
-
-        except Exception as e:
-            st.error(f"เกิดข้อผิดพลาดในการประมวลผลไฟล์ '{filename}': {e}")
-            error_files.append(f"{filename} (Processing Error: {e})")
-            continue
-
-    progress_bar.empty()
-
-    # --- แสดงผลลัพธ์รวม (DataFrame ที่มี 1 แถวต่อไฟล์) ---
-    if all_results_list:
-        st.subheader("📊 ผลลัพธ์ Metadata รวม (1 แถวต่อไฟล์):")
-        # --- !!! สร้าง DataFrame จาก List ของ Dictionary !!! ---
-        final_df = pd.DataFrame(all_results_list)
-        st.dataframe(final_df, hide_index=True, use_container_width=True)
-
-        # --- ปุ่ม Download CSV (เหมือนเดิม) ---
-        csv_data = convert_df_to_csv(final_df)
-        st.download_button(
-           label="📥 ดาวน์โหลดผลลัพธ์เป็น CSV",
-           data=csv_data,
-           file_name='gemini_metadata_export.csv',
-           mime='text/csv',
-        )
+# --- ประมวลผลเมื่อกดปุ่ม ---
+if process_button_clicked:
+    if not api_key:
+         st.error("⛔ ไม่พบ Google AI API Key.")
+    elif not uploaded_files:
+         st.warning("⚠️ กรุณาอัปโหลดรูปภาพก่อน")
+    # --- !!! ตรวจสอบเงื่อนไขสำหรับโหมดแก้ไข !!! ---
+    elif processing_mode == "แก้ไขข้อมูลที่ขาดหายจากไฟล์ CSV ที่อัปโหลด" and not existing_csv_file:
+         st.error("⛔ กรุณาอัปโหลดไฟล์ CSV เดิมสำหรับโหมดแก้ไข")
     else:
-        st.info("ไม่มีผลลัพธ์ให้แสดง อาจเกิดข้อผิดพลาดกับทุกไฟล์ที่อัปโหลด")
+        # --- Logic การทำงานตาม Mode ที่เลือก ---
 
-    if error_files:
-         st.warning("ไฟล์ต่อไปนี้เกิดข้อผิดพลาดระหว่างประมวลผล:")
-         for err_file in error_files:
-             st.markdown(f"- `{err_file}`")
+        start_time = time.time()
+        error_files = []
+        final_df = pd.DataFrame() # สร้าง DataFrame ว่างไว้ก่อน
+
+        # --- โหมดปกติ: ประมวลผลไฟล์ใหม่ / ทำต่อจากไฟล์ชั่วคราว ---
+        if processing_mode == "ประมวลผลไฟล์ใหม่ / ทำต่อจากไฟล์ชั่วคราว (สร้าง/อัปเดต temp_metadata_incremental.csv)":
+            st.info(f"โหมดปกติ: กำลังประมวลผลไฟล์ใหม่และเขียนลง {TEMP_CSV_FILENAME}")
+            processed_filenames = set()
+            if os.path.exists(TEMP_CSV_FILENAME):
+                try:
+                    existing_df_temp = pd.read_csv(TEMP_CSV_FILENAME, encoding='utf-8')
+                    processed_filenames = set(existing_df_temp.iloc[:, 0].unique())
+                    st.success(f"พบข้อมูลเก่า {len(processed_filenames)} ไฟล์ใน {TEMP_CSV_FILENAME}")
+                except Exception as e:
+                    st.warning(f"ไม่สามารถอ่าน {TEMP_CSV_FILENAME}: {e}. จะสร้างใหม่")
+                    processed_filenames = set()
+
+            total_files_to_process = len([f for f in uploaded_files if f.name not in processed_filenames])
+            if total_files_to_process == 0 and processed_filenames:
+                 st.info("✅ ไฟล์ที่เลือกทั้งหมดได้ถูกประมวลผลไปแล้วในครั้งก่อน (ดูผลจากไฟล์ CSV ชั่วคราว)")
+                 # โหลดข้อมูลจากไฟล์เก่ามาแสดงเลย
+                 try:
+                    final_df = pd.read_csv(TEMP_CSV_FILENAME, encoding='utf-8')
+                 except Exception as e:
+                    st.error(f"ไม่สามารถโหลดข้อมูลจาก {TEMP_CSV_FILENAME}: {e}")
+
+            elif total_files_to_process > 0:
+                time_placeholder = st.empty()
+                progress_bar = st.progress(0, text=f"กำลังเตรียมประมวลผล {total_files_to_process} ไฟล์ใหม่...")
+                current_new_file_index = 0
+
+                for uploaded_file in uploaded_files:
+                    filename = uploaded_file.name
+                    if filename in processed_filenames: continue
+
+                    current_new_file_index += 1
+                    # (โค้ดแสดง Progress และ เวลา เหมือนเดิม)
+                    progress_text = f"กำลังประมวลผล: {filename} ({current_new_file_index}/{total_files_to_process})"
+                    progress_bar.progress(current_new_file_index / total_files_to_process, text=progress_text)
+                    # ... (โค้ดคำนวณและแสดงเวลา) ...
+                    current_time = time.time(); elapsed_time = current_time - start_time; avg_time_per_file = elapsed_time / current_new_file_index if current_new_file_index > 0 else 0
+                    files_remaining = total_files_to_process - current_new_file_index; estimated_time_remaining = avg_time_per_file * files_remaining if avg_time_per_file > 0 else 0
+                    estimated_completion_time = datetime.now() + timedelta(seconds=estimated_time_remaining); elapsed_str = str(timedelta(seconds=int(elapsed_time)))
+                    remaining_str = str(timedelta(seconds=int(estimated_time_remaining))) if estimated_time_remaining > 0 else "--:--:--"; eta_str = estimated_completion_time.strftime("%H:%M:%S") if estimated_time_remaining > 0 else "N/A"
+                    time_placeholder.info(f"⏱️ เวลา: {elapsed_str} | เหลือ: {remaining_str} | เสร็จ: {eta_str} ({avg_time_per_file:.2f} วิ/ภาพ)")
+
+                    try:
+                        image = Image.open(uploaded_file)
+                        prompt = f"""Analyze the image ({filename}). Generate:\n1. Up to {num_titles_req} Titles (new line each).\n2. Up to {num_keywords_req} Keywords (comma-separated, prefix 'Keywords:')."""
+                        gemini_result_text = get_gemini_response(api_key, image, prompt)
+
+                        if gemini_result_text == "API_SAFETY_BLOCK": error_files.append(f"{filename} (Safety Block)"); continue
+                        elif gemini_result_text == "API_RESPONSE_ERROR": error_files.append(f"{filename} (API Response Error)"); continue
+                        elif gemini_result_text is None: error_files.append(f"{filename} (API Call Failed)"); continue
+                        else:
+                            suggested_titles_list, suggested_keywords_list = parse_gemini_metadata_v5(gemini_result_text, num_titles_req, num_keywords_req)
+                            titles_str = ", ".join(suggested_titles_list) if suggested_titles_list else "-"
+                            keywords_str = ", ".join(suggested_keywords_list) if suggested_keywords_list else "-"
+                            temp_df = pd.DataFrame([{"Filename": filename, "Title": titles_str, "Keywords": keywords_str}])
+                            write_header = not os.path.exists(TEMP_CSV_FILENAME)
+                            temp_df.to_csv(TEMP_CSV_FILENAME, mode='a', header=write_header, index=False, encoding='utf-8')
+
+                    except Exception as e: error_files.append(f"{filename} (Processing Error: {e})"); continue
+
+                progress_bar.empty()
+                time_placeholder.success(f"🎉 ประมวลผลไฟล์ใหม่เสร็จสิ้นในเวลา {str(timedelta(seconds=int(time.time() - start_time)))}!")
+                # อ่านข้อมูล *ทั้งหมด* จาก CSV มาแสดงผลสุดท้าย
+                if os.path.exists(TEMP_CSV_FILENAME):
+                     try: final_df = pd.read_csv(TEMP_CSV_FILENAME, encoding='utf-8')
+                     except Exception as e: st.error(f"ไม่สามารถโหลดข้อมูลสุดท้ายจาก {TEMP_CSV_FILENAME}: {e}")
 
 
-elif not api_key and uploaded_files:
-     st.warning("กรุณาใส่ Google AI API Key ของคุณก่อน")
+        # --- โหมดแก้ไข: อ่าน CSV, หาแถวที่ต้องทำใหม่, ประมวลผล, อัปเดต DataFrame ---
+        elif processing_mode == "แก้ไขข้อมูลที่ขาดหายจากไฟล์ CSV ที่อัปโหลด":
+            st.info(f"โหมดแก้ไข: กำลังอ่าน {existing_csv_file.name} และหาข้อมูลที่ขาดหาย...")
+            try:
+                existing_df = pd.read_csv(existing_csv_file, encoding='utf-8')
+                # ตรวจสอบคอลัมน์ที่จำเป็น
+                if not all(col in existing_df.columns for col in ["Filename", "Title", "Keywords"]):
+                    st.error("⛔ ไฟล์ CSV ที่อัปโหลดไม่มีคอลัมน์ 'Filename', 'Title', และ 'Keywords'")
+                else:
+                    # หาแถวที่ Title หรือ Keywords เป็น "-" (หรือค่าว่างอื่นๆ ที่อาจใช้)
+                    # ใช้ .fillna('-') เพื่อจัดการกับค่า NaN ที่อาจเกิดขึ้นตอนอ่าน CSV แล้วค่อยเทียบ
+                    rows_to_rerun_index = existing_df[
+                        (existing_df['Title'].fillna('-') == '-') |
+                        (existing_df['Keywords'].fillna('-') == '-')
+                    ].index
+                    filenames_to_rerun = existing_df.loc[rows_to_rerun_index, 'Filename'].tolist()
+
+                    if not filenames_to_rerun:
+                        st.success("✅ ไม่พบข้อมูลที่ขาดหายในไฟล์ CSV ที่อัปโหลด")
+                        final_df = existing_df # ใช้ข้อมูลเดิมแสดงผล
+                    else:
+                        st.info(f"พบ {len(filenames_to_rerun)} ไฟล์ที่ต้องประมวลผลใหม่: {', '.join(filenames_to_rerun[:5])}{'...' if len(filenames_to_rerun)>5 else ''}")
+
+                        uploaded_file_map = {f.name: f for f in uploaded_files} # สร้าง Map เพื่อหาไฟล์รูปง่ายๆ
+                        processed_count_rerun = 0
+                        time_placeholder = st.empty()
+                        progress_bar = st.progress(0, text=f"กำลังเตรียมประมวลผล {len(filenames_to_rerun)} ไฟล์...")
+
+                        # สร้าง DataFrame ที่จะอัปเดต (เริ่มจากข้อมูลเดิม)
+                        updated_df = existing_df.copy()
+
+                        for idx in rows_to_rerun_index: # วน Loop ตาม Index ที่ต้องทำใหม่
+                            filename = updated_df.loc[idx, 'Filename']
+
+                            # ตรวจสอบว่ามีไฟล์รูปภาพที่อัปโหลดตรงกันไหม
+                            if filename not in uploaded_file_map:
+                                st.warning(f"ไม่พบไฟล์รูปภาพ '{filename}' ที่อัปโหลดสำหรับแก้ไขข้อมูล")
+                                error_files.append(f"{filename} (Missing Image File for Rerun)")
+                                continue
+
+                            processed_count_rerun += 1
+                            # (โค้ดแสดง Progress และ เวลา เหมือนเดิม)
+                            progress_text = f"กำลังแก้ไข: {filename} ({processed_count_rerun}/{len(filenames_to_rerun)})"
+                            progress_bar.progress(processed_count_rerun / len(filenames_to_rerun), text=progress_text)
+                            # ... (โค้ดคำนวณและแสดงเวลา) ...
+                            current_time = time.time(); elapsed_time = current_time - start_time; avg_time_per_file = elapsed_time / processed_count_rerun if processed_count_rerun > 0 else 0
+                            files_remaining = len(filenames_to_rerun) - processed_count_rerun; estimated_time_remaining = avg_time_per_file * files_remaining if avg_time_per_file > 0 else 0
+                            estimated_completion_time = datetime.now() + timedelta(seconds=estimated_time_remaining); elapsed_str = str(timedelta(seconds=int(elapsed_time)))
+                            remaining_str = str(timedelta(seconds=int(estimated_time_remaining))) if estimated_time_remaining > 0 else "--:--:--"; eta_str = estimated_completion_time.strftime("%H:%M:%S") if estimated_time_remaining > 0 else "N/A"
+                            time_placeholder.info(f"⏱️ เวลา: {elapsed_str} | เหลือ: {remaining_str} | เสร็จ: {eta_str} ({avg_time_per_file:.2f} วิ/ภาพ)")
+
+                            try:
+                                uploaded_file = uploaded_file_map[filename]
+                                image = Image.open(uploaded_file)
+                                prompt = f"""Analyze the image ({filename}). Generate:\n1. Up to {num_titles_req} Titles (new line each).\n2. Up to {num_keywords_req} Keywords (comma-separated, prefix 'Keywords:')."""
+                                gemini_result_text = get_gemini_response(api_key, image, prompt)
+
+                                if gemini_result_text == "API_SAFETY_BLOCK": error_files.append(f"{filename} (Safety Block)"); continue
+                                elif gemini_result_text == "API_RESPONSE_ERROR": error_files.append(f"{filename} (API Response Error)"); continue
+                                elif gemini_result_text is None: error_files.append(f"{filename} (API Call Failed)"); continue
+                                else:
+                                    suggested_titles_list, suggested_keywords_list = parse_gemini_metadata_v5(gemini_result_text, num_titles_req, num_keywords_req)
+                                    titles_str = ", ".join(suggested_titles_list) if suggested_titles_list else "-"
+                                    keywords_str = ", ".join(suggested_keywords_list) if suggested_keywords_list else "-"
+
+                                    # --- !!! อัปเดตข้อมูลใน DataFrame โดยตรง !!! ---
+                                    updated_df.loc[idx, 'Title'] = titles_str
+                                    updated_df.loc[idx, 'Keywords'] = keywords_str
+
+                            except Exception as e: error_files.append(f"{filename} (Processing Error: {e})"); continue
+
+                        progress_bar.empty()
+                        time_placeholder.success(f"🎉 แก้ไขข้อมูล {processed_count_rerun} ไฟล์เสร็จสิ้นในเวลา {str(timedelta(seconds=int(time.time() - start_time)))}!")
+                        final_df = updated_df # ใช้ DataFrame ที่อัปเดตแล้ว
+
+            except Exception as e:
+                st.error(f"เกิดข้อผิดพลาดในการอ่านหรือประมวลผลไฟล์ CSV ที่อัปโหลด: {e}")
+
+        # --- แสดงผลลัพธ์รวม (จาก final_df ที่ได้จากโหมดใดโหมดหนึ่ง) ---
+        if not final_df.empty: # ตรวจสอบว่า DataFrame ไม่ว่าง
+            st.subheader("📊 ผลลัพธ์ Metadata:")
+            st.dataframe(final_df, hide_index=True, use_container_width=True)
+            csv_data = convert_df_to_csv(final_df)
+            # กำหนดชื่อไฟล์ดาวน์โหลดตามโหมด
+            csv_filename = "gemini_metadata_rerun.csv" if processing_mode == "แก้ไขข้อมูลที่ขาดหายจากไฟล์ CSV ที่อัปโหลด" else "gemini_metadata_export_all.csv"
+            st.download_button(
+               label=f"📥 ดาวน์โหลดผลลัพธ์ ({'แก้ไขแล้ว' if processing_mode == 'แก้ไขข้อมูลที่ขาดหายจากไฟล์ CSV ที่อัปโหลด' else 'ทั้งหมด'}) เป็น CSV",
+               data=csv_data,
+               file_name=csv_filename,
+               mime='text/csv',
+            )
+        elif not error_files: # ถ้า DataFrame ว่าง และไม่มี Error อื่นๆ
+             st.info("ไม่มีผลลัพธ์ให้แสดง")
+
+
+        if error_files:
+             st.warning("ไฟล์ต่อไปนี้เกิดข้อผิดพลาด หรือถูกบล็อก:")
+             for err_file in error_files:
+                 st.markdown(f"- `{err_file}`")
+
+# --- แสดงข้อความแนะนำเริ่มต้น ---
 elif not uploaded_files:
-     st.info("กรุณาอัปโหลดรูปภาพ (เลือกได้หลายไฟล์)...")
+     st.info("กรุณาอัปโหลดรูปภาพ, กำหนดค่า, เลือกโหมด, แล้วกดปุ่มเริ่ม")
 
 # --- หมายเหตุท้ายแอป ---
 st.markdown("---")
-st.caption("สร้างโดยใช้ Streamlit, Pandas และ Google Gemini API (Model: gemini-1.5-flash, Default Safety)")
+st.caption("สร้างโดยใช้ Streamlit, Pandas และ Google Gemini API (Model: gemini-1.5-flash, Default Safety, Resumable & Rerun)")
